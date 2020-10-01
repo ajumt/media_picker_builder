@@ -6,6 +6,7 @@
 //
 import Foundation
 import Photos
+import MobileCoreServices
 
 class FileFetcher {
     static func getAlbums(withImages: Bool, withVideos: Bool, loadPaths: Bool)-> [Album] {
@@ -78,8 +79,12 @@ class FileFetcher {
             return cachePath.path
         }
 
-        if generateThumbnail(asset: asset!, destination: cachePath) {
-            return cachePath.path
+        do {
+            if try generateThumbnail(asset: asset!, destination: cachePath) {
+                return cachePath.path
+            }
+        } catch {
+            print(error)
         }
 
         return nil
@@ -89,6 +94,7 @@ class FileFetcher {
 
         var mediaFile: MediaFile? = nil
         var url: String? = nil
+        var fileName: String? = nil
         var duration: Double? = nil
         var orientation: Int = 0
 
@@ -96,8 +102,12 @@ class FileFetcher {
         var cachePath: URL? = getCachePath(for: asset.localIdentifier, modificationDate: modificationDate)
         if !FileManager.default.fileExists(atPath: cachePath!.path) {
             if generateThumbnailIfNotFound {
-                if !generateThumbnail(asset: asset, destination: cachePath!) {
-                    cachePath = nil
+                do {
+                    if try !generateThumbnail(asset: asset, destination: cachePath!) {
+                        cachePath = nil
+                    }
+                } catch {
+                    print(error)
                 }
             } else {
                 cachePath = nil
@@ -108,7 +118,7 @@ class FileFetcher {
 
             if loadPath {
 
-                (url, orientation) = getFullSizeImageURLAndOrientation(for: asset)
+                (url, orientation, fileName) = getFullSizeImageURLAndOrientation(for: asset)
 
                 // Not working since iOS 13
                 // (url, orientation) = getPHImageFileURLKeyAndOrientation(for: asset)
@@ -130,17 +140,29 @@ class FileFetcher {
                 orientation: orientation,
                 duration: nil,
                 mimeType: nil,
+                fileName: fileName,
                 type: .IMAGE)
 
         } else if (asset.mediaType == .video) {
 
             if loadPath {
+                if #available(iOS 9, *) {
+                    fileName = PHAssetResource.assetResources(for: asset).first?.originalFilename
+                }
+
                 let semaphore = DispatchSemaphore(value: 0)
                 let options = PHVideoRequestOptions()
                 options.isNetworkAccessAllowed = true
-                PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { (avAsset, _, info) in
+                PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { (avAssetData, _, info) in
+                    var avAsset = avAssetData
+                    if avAssetData is AVComposition {
+                        avAsset = convertAvcompositionToAvasset(avComp: (avAssetData as? AVComposition)!)
+                    }
                     let avURLAsset = avAsset as? AVURLAsset
                     url = avURLAsset?.url.path
+                    if(fileName==nil) {
+                        fileName = avURLAsset?.url.lastPathComponent
+                    }
                     let durationTime = avAsset?.duration
                     if durationTime != nil {
                         duration = (CMTimeGetSeconds(durationTime!) * 1000).rounded()
@@ -169,32 +191,70 @@ class FileFetcher {
                 orientation: 0,
                 duration: duration,
                 mimeType: nil,
+                fileName: fileName,
                 type: .VIDEO)
 
         }
         return mediaFile
     }
 
-    private static func generateThumbnail(asset: PHAsset, destination: URL) -> Bool {
-
+    private static func generateThumbnail(asset: PHAsset, destination: URL) throws -> Bool {
         let scale = UIScreen.main.scale
         let imageSize = CGSize(width: 79 * scale, height: 79 * scale)
         let imageContentMode: PHImageContentMode = .aspectFill
         let options = PHImageRequestOptions()
         options.isSynchronous = true
         options.isNetworkAccessAllowed = true
+        options.resizeMode = .fast
         var saved = false
-        PHCachingImageManager.default().requestImage(for: asset, targetSize: imageSize, contentMode: imageContentMode, options: options) { (image, info) in
-            do {
-                try image!.pngData()?.write(to: destination)
-                saved = true
-            } catch (let error) {
-                print(error)
-                saved = false
-            }
 
+        PHCachingImageManager.default().requestImage(for: asset, targetSize: imageSize, contentMode: imageContentMode, options: options) { (image, info) in
+            if(image != nil) {
+                if let imageRep = image!.pngData() {
+                    do {
+                        try imageRep.write(to: destination)
+                        saved = true
+                    } catch {
+                        print(error)
+                        saved = false
+                    }
+                }
+            }
         }
         return saved
+    }
+
+    private static func generateThumbnail2(asset: PHAsset, destination: URL) throws -> Bool {
+        let options = PHImageRequestOptions()
+        options.isSynchronous = true
+        options.isNetworkAccessAllowed = true
+        options.resizeMode = .fast
+        var saved = false;
+        PHImageManager.default().requestImageData(for: asset, options: options, resultHandler:{ (data, responseString, imageOriet, info) -> Void in
+
+            let imageData: NSData = data! as NSData
+            // create an image source ref
+            if let source = CGImageSourceCreateWithData(imageData as CFData, nil) {
+                // get image properties
+                if let sourceProperties = CGImageSourceCopyProperties(source, nil) {
+                    // create a new data object and write the new image into it
+                    if let destination = CGImageDestinationCreateWithURL(destination as CFURL, kUTTypePNG, 1, nil) {
+                        let resizeOptions = [
+                            kCGImageSourceThumbnailMaxPixelSize: 140,
+                            kCGImageSourceCreateThumbnailFromImageAlways: true,
+                            kCGImageSourceCreateThumbnailWithTransform: true
+                            ] as CFDictionary
+
+                        if let thumbnailImage = CGImageSourceCreateThumbnailAtIndex(source, 0, resizeOptions) {
+                            // add the image contained in the image source to the destination, overidding the old metadata with our modified metadata
+                            CGImageDestinationAddImage(destination, thumbnailImage, sourceProperties)
+                            saved = CGImageDestinationFinalize(destination)
+                        }
+                    }
+                }
+            }
+        })
+        return saved;
     }
 
     private static func getCachePath(for identifier: String, modificationDate: Int) -> URL {
@@ -205,20 +265,30 @@ class FileFetcher {
         return path
     }
 
-    private static func getFullSizeImageURLAndOrientation(for asset: PHAsset)-> (String?, Int) {
-        var url: String? = nil
+    private static func getFullSizeImageURLAndOrientation(for asset: PHAsset)-> (String?, Int, String?) {
+        var fileName: String? = nil
+        if #available(iOS 9, *) {
+            let assetResources = PHAssetResource.assetResources(for: asset)
+            fileName = assetResources.first(where: {$0.type == .photo})?.originalFilename
+        }
+
+        var url: URL? = nil
         var orientation: Int = 0
         let semaphore = DispatchSemaphore(value: 0)
         let options2 = PHContentEditingInputRequestOptions()
         options2.isNetworkAccessAllowed = true
         asset.requestContentEditingInput(with: options2){(input, info) in
             orientation = Int(input?.fullSizeImageOrientation ?? 0)
-            url = input?.fullSizeImageURL?.path
+            url = input?.fullSizeImageURL
             semaphore.signal()
         }
         semaphore.wait()
 
-        return (url, orientation)
+        if (fileName==nil) {
+            fileName = url?.lastPathComponent
+        }
+
+        return (url?.path, orientation, fileName)
     }
 
     private static func getPHImageFileURLKeyAndOrientation(for asset: PHAsset) -> (String?, Int) {
@@ -233,9 +303,31 @@ class FileFetcher {
         }
         return (url, orientation)
     }
+
+    private static func convertAvcompositionToAvasset(avComp: AVComposition) -> AVAsset? {
+        let exporter = AVAssetExportSession(asset: avComp, presetName: AVAssetExportPresetHighestQuality)
+        let randNum:Int = Int(arc4random())
+        //Generating Export Path
+        let exportPath: NSString = NSTemporaryDirectory().appendingFormat("\(randNum)"+"video.mov") as NSString
+        let exportUrl: NSURL = NSURL.fileURL(withPath: exportPath as String) as NSURL
+        //SettingUp Export Path as URL
+        exporter?.outputURL = exportUrl as URL
+        exporter?.outputFileType = AVFileType.mov
+        var avAsset: AVAsset?
+        let semaphore = DispatchSemaphore(value: 0)
+        exporter?.exportAsynchronously(completionHandler: {() -> Void in
+            if exporter?.status == .completed {
+                let url = exporter?.outputURL
+                avAsset = AVAsset(url: url!)
+            }
+            semaphore.signal()
+        })
+        semaphore.wait()
+        return avAsset
+    }
 }
 
-extension UIImage.Orientation{
+extension UIImageOrientation{
     func inDegrees() -> Int {
         switch  self {
         case .down:
@@ -253,8 +345,6 @@ extension UIImage.Orientation{
         case .up:
             return 0
         case .upMirrored:
-            return 0
-        @unknown default:
             return 0
         }
     }

@@ -327,7 +327,7 @@ class FileFetcher {
     }
 }
 
-extension UIImageOrientation{
+extension UIImage.Orientation{
     func inDegrees() -> Int {
         switch  self {
         case .down:
@@ -345,6 +345,8 @@ extension UIImageOrientation{
         case .up:
             return 0
         case .upMirrored:
+            return 0
+        default:
             return 0
         }
     }
